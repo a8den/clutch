@@ -1,0 +1,357 @@
+/**
+ * Clutch Price Scraper
+ * Cloudflare Worker — runs on cron schedule (daily 6am ET)
+ *
+ * Sources: Back Market Trade-in API + SellCell
+ * Strategy: take the LOWER of the two prices to protect margin
+ * Filter: drop anything with a payout under MIN_PAYOUT_CENTS
+ */
+
+const MIN_PAYOUT_CENTS = 5000; // $50.00
+
+// ─── Back Market trade-in API ────────────────────────────────────────────────
+// Back Market has a public trade-in/buyback flow. We hit their product catalog
+// endpoint which returns buyback pricing without auth.
+async function fetchBackMarket() {
+  const results = [];
+
+  // Back Market buyback catalog — paginated
+  let page = 1;
+  let hasMore = true;
+
+  while (hasMore) {
+    const url = `https://www.backmarket.com/bm/buyback/api/products?page=${page}&page_size=100`;
+    const res = await fetch(url, {
+      headers: {
+        'Accept': 'application/json',
+        'Accept-Language': 'en-US',
+        'User-Agent': 'Mozilla/5.0 (compatible; ClutchPricer/1.0)'
+      }
+    });
+
+    if (!res.ok) break;
+
+    const data = await res.json();
+    const items = data.results || data.products || [];
+    if (items.length === 0) { hasMore = false; break; }
+
+    for (const item of items) {
+      // Back Market returns grades: 'excellent', 'good', 'fair'
+      const grades = item.grades || item.conditions || [];
+      for (const grade of grades) {
+        const priceCents = Math.round((grade.price || grade.amount || 0) * 100);
+        if (priceCents < MIN_PAYOUT_CENTS) continue;
+
+        results.push({
+          model: item.title || item.name,
+          brand: item.brand || deriveBrand(item.title),
+          storage: extractStorage(item.title),
+          condition: normalizeCondition(grade.label || grade.grade),
+          price_cents: priceCents,
+          source: 'backmarket'
+        });
+      }
+    }
+
+    // Check if there's a next page
+    hasMore = !!(data.next || (data.total > page * 100));
+    page++;
+
+    // Safety cap — don't loop forever
+    if (page > 30) break;
+
+    // Be polite to their servers
+    await sleep(500);
+  }
+
+  return results;
+}
+
+// ─── SellCell scraper ────────────────────────────────────────────────────────
+async function fetchSellCell() {
+  const results = [];
+
+  // SellCell comparison page returns JSON data we can parse
+  const brands = ['apple', 'samsung'];
+
+  for (const brand of brands) {
+    const url = `https://www.sellcell.com/sell-${brand}-phones/`;
+    const res = await fetch(url, {
+      headers: {
+        'Accept': 'text/html',
+        'User-Agent': 'Mozilla/5.0 (compatible; ClutchPricer/1.0)'
+      }
+    });
+
+    if (!res.ok) continue;
+
+    const html = await res.text();
+
+    // SellCell embeds price data as JSON in a script tag
+    const match = html.match(/window\.__INITIAL_STATE__\s*=\s*({.+?});<\/script>/s)
+      || html.match(/var productData\s*=\s*(\[.+?\]);/s);
+
+    if (!match) continue;
+
+    try {
+      const data = JSON.parse(match[1]);
+      const products = extractSellCellProducts(data);
+
+      for (const p of products) {
+        if (p.price_cents < MIN_PAYOUT_CENTS) continue;
+        results.push({ ...p, source: 'sellcell' });
+      }
+    } catch (e) {
+      console.error(`SellCell parse error for ${brand}:`, e.message);
+    }
+
+    await sleep(300);
+  }
+
+  return results;
+}
+
+function extractSellCellProducts(data) {
+  const out = [];
+  // Handle various SellCell data shapes
+  const items = Array.isArray(data) ? data
+    : data.products || data.phones || data.devices || [];
+
+  for (const item of items) {
+    const conditions = item.conditions || item.grades || [];
+    for (const c of conditions) {
+      const price = c.price || c.amount || c.value || 0;
+      out.push({
+        model: item.name || item.title,
+        brand: item.brand || deriveBrand(item.name),
+        storage: extractStorage(item.name),
+        condition: normalizeCondition(c.name || c.label),
+        price_cents: Math.round(price * 100)
+      });
+    }
+  }
+  return out;
+}
+
+// ─── Merge + take lower price ────────────────────────────────────────────────
+function mergePrices(backMarketItems, sellCellItems) {
+  const map = new Map();
+
+  const key = (item) =>
+    `${item.model}||${item.storage || ''}||${item.condition}`.toLowerCase();
+
+  for (const item of backMarketItems) {
+    const k = key(item);
+    if (!map.has(k)) map.set(k, { ...item, backmarket_price: item.price_cents, sellcell_price: null });
+    else map.get(k).backmarket_price = item.price_cents;
+  }
+
+  for (const item of sellCellItems) {
+    const k = key(item);
+    if (!map.has(k)) map.set(k, { ...item, sellcell_price: item.price_cents, backmarket_price: null });
+    else map.get(k).sellcell_price = item.price_cents;
+  }
+
+  const merged = [];
+  for (const [, item] of map) {
+    const prices = [item.backmarket_price, item.sellcell_price].filter(Boolean);
+    if (prices.length === 0) continue;
+
+    const offer = Math.min(...prices); // take the LOWER price
+    if (offer < MIN_PAYOUT_CENTS) continue;
+
+    merged.push({
+      model: item.model,
+      brand: item.brand,
+      storage: item.storage,
+      condition: item.condition,
+      device_type: deriveDeviceType(item.model, item.brand),
+      sellcell_price: item.sellcell_price,
+      backmarket_price: item.backmarket_price,
+      offer_price: offer
+    });
+  }
+
+  return merged;
+}
+
+// ─── Write to D1 ─────────────────────────────────────────────────────────────
+async function writeToD1(db, items) {
+  const now = new Date().toISOString();
+
+  // Clear old prices and rewrite fresh
+  await db.prepare('DELETE FROM prices').run();
+
+  const stmt = db.prepare(`
+    INSERT INTO prices
+      (device_type, brand, model, storage, condition, sellcell_price, backmarket_price, offer_price, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  // Batch in chunks of 100
+  const chunks = chunkArray(items, 100);
+  for (const chunk of chunks) {
+    await db.batch(
+      chunk.map(item => stmt.bind(
+        item.device_type,
+        item.brand,
+        item.model,
+        item.storage || null,
+        item.condition,
+        item.sellcell_price || null,
+        item.backmarket_price || null,
+        item.offer_price,
+        now
+      ))
+    );
+  }
+
+  await db.prepare(`UPDATE config SET value = ? WHERE key = 'last_scrape'`)
+    .bind(now).run();
+
+  return items.length;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function normalizeCondition(raw) {
+  if (!raw) return 'Good';
+  const s = raw.toLowerCase();
+  if (s.includes('excel') || s.includes('mint') || s.includes('like new')) return 'Excellent';
+  if (s.includes('good') || s.includes('grade b')) return 'Good';
+  if (s.includes('fair') || s.includes('poor') || s.includes('grade c')) return 'Fair';
+  return 'Good';
+}
+
+function extractStorage(title) {
+  if (!title) return null;
+  const m = title.match(/(\d+)\s*(GB|TB)/i);
+  if (!m) return null;
+  return m[2].toUpperCase() === 'TB' ? `${m[1]}TB` : `${m[1]}GB`;
+}
+
+function deriveBrand(title) {
+  if (!title) return 'Unknown';
+  const t = title.toLowerCase();
+  if (t.includes('iphone') || t.includes('ipad') || t.includes('macbook') || t.includes('apple watch') || t.includes('airpods')) return 'Apple';
+  if (t.includes('samsung') || t.includes('galaxy')) return 'Samsung';
+  if (t.includes('playstation') || t.includes('ps4') || t.includes('ps5')) return 'Sony';
+  if (t.includes('xbox')) return 'Microsoft';
+  if (t.includes('nintendo') || t.includes('switch')) return 'Nintendo';
+  return 'Other';
+}
+
+function deriveDeviceType(model, brand) {
+  if (!model) return 'other';
+  const m = model.toLowerCase();
+  if (m.includes('iphone')) return 'iphone';
+  if (m.includes('ipad')) return 'ipad';
+  if (m.includes('macbook')) return 'macbook';
+  if (m.includes('apple watch')) return 'watch';
+  if (m.includes('airpods')) return 'airpods';
+  if (m.includes('galaxy') || (brand === 'Samsung')) return 'samsung';
+  if (m.includes('ps4') || m.includes('ps5') || m.includes('playstation') || m.includes('xbox') || m.includes('switch') || m.includes('nintendo')) return 'console';
+  return 'other';
+}
+
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+  return chunks;
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// ─── Worker entry point ───────────────────────────────────────────────────────
+export default {
+  // Cron trigger — runs daily at 6am ET (10:00 UTC)
+  async scheduled(event, env, ctx) {
+    console.log('Clutch price scrape starting...');
+    try {
+      const [backMarketItems, sellCellItems] = await Promise.allSettled([
+        fetchBackMarket(),
+        fetchSellCell()
+      ]);
+
+      const bm = backMarketItems.status === 'fulfilled' ? backMarketItems.value : [];
+      const sc = sellCellItems.status === 'fulfilled' ? sellCellItems.value : [];
+
+      console.log(`Back Market: ${bm.length} items, SellCell: ${sc.length} items`);
+
+      const merged = mergePrices(bm, sc);
+      console.log(`Merged: ${merged.length} items above $${MIN_PAYOUT_CENTS / 100} threshold`);
+
+      const count = await writeToD1(env.DB, merged);
+      console.log(`Wrote ${count} prices to D1`);
+    } catch (err) {
+      console.error('Scrape failed:', err);
+      // Don't throw — let the old prices stay in D1
+    }
+  },
+
+  // HTTP endpoint — lets the site fetch prices, and lets you trigger a manual scrape
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': 'https://clutch.mancinimerchandising.com',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Content-Type': 'application/json'
+    };
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    // GET /prices?type=iphone  — fetch prices for a device type
+    if (url.pathname === '/prices') {
+      const type = url.searchParams.get('type');
+      const model = url.searchParams.get('model');
+      const storage = url.searchParams.get('storage');
+      const condition = url.searchParams.get('condition');
+
+      let query = 'SELECT * FROM prices WHERE 1=1';
+      const params = [];
+
+      if (type) { query += ' AND device_type = ?'; params.push(type); }
+      if (model) { query += ' AND model = ?'; params.push(model); }
+      if (storage) { query += ' AND storage = ?'; params.push(storage); }
+      if (condition) { query += ' AND condition = ?'; params.push(condition); }
+
+      query += ' ORDER BY device_type, model, storage, condition';
+
+      const { results } = await env.DB.prepare(query).bind(...params).all();
+      return new Response(JSON.stringify({ prices: results }), { headers: corsHeaders });
+    }
+
+    // GET /models?type=iphone  — distinct model list for a device type
+    if (url.pathname === '/models') {
+      const type = url.searchParams.get('type') || 'iphone';
+      const { results } = await env.DB.prepare(
+        'SELECT DISTINCT model, brand FROM prices WHERE device_type = ? ORDER BY model'
+      ).bind(type).all();
+      return new Response(JSON.stringify({ models: results }), { headers: corsHeaders });
+    }
+
+    // GET /status  — last scrape time + price count
+    if (url.pathname === '/status') {
+      const { results } = await env.DB.prepare(
+        `SELECT (SELECT value FROM config WHERE key='last_scrape') as last_scrape,
+                (SELECT COUNT(*) FROM prices) as price_count`
+      ).all();
+      return new Response(JSON.stringify(results[0]), { headers: corsHeaders });
+    }
+
+    // POST /scrape  — manual trigger (admin only, protected by secret header)
+    if (url.pathname === '/scrape' && request.method === 'POST') {
+      const auth = request.headers.get('X-Admin-Secret');
+      if (auth !== env.ADMIN_SECRET) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
+      }
+      ctx.waitUntil(this.scheduled(null, env, ctx));
+      return new Response(JSON.stringify({ message: 'Scrape triggered' }), { headers: corsHeaders });
+    }
+
+    return new Response(JSON.stringify({ error: 'Not found' }), { status: 404, headers: corsHeaders });
+  }
+};

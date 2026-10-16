@@ -1,0 +1,20 @@
+name = "clutch-pricer"
+main = "src/scraper.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Cron: runs daily at 10:00 UTC = 6:00am ET
+[triggers]
+crons = ["0 10 * * *"]
+
+# D1 database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "clutch-db"
+database_id = "REPLACE_WITH_YOUR_D1_ID"
+
+# Secrets (set via: wrangler secret put ADMIN_SECRET)
+# ADMIN_SECRET — protects the /scrape manual trigger endpoint
+
+[vars]
+MIN_PAYOUT = "50"
