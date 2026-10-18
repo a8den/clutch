@@ -7,7 +7,8 @@
  * Filter: drop anything with a payout under MIN_PAYOUT_CENTS
  */
 
-const MIN_PAYOUT_CENTS = 5000; // $50.00
+const MIN_PAYOUT_CENTS = 5000;          // $50.00 minimum offer
+const SHIP_TO_US_THRESHOLD_CENTS = 20000; // $200.00 client payout — route to Clutch first for inspection
 
 // ─── Back Market trade-in API ────────────────────────────────────────────────
 // Back Market has a public trade-in/buyback flow. We hit their product catalog
@@ -133,7 +134,75 @@ function extractSellCellProducts(data) {
   return out;
 }
 
-// ─── Merge + take lower price ────────────────────────────────────────────────
+// ─── ROI multipliers by device generation + condition ────────────────────────
+// Formula: offer_price = exit_price / multiplier
+// Generations:
+//   flagship — iPhone 15+, Galaxy S24+, iPad Pro M2+, MacBook M2+, PS5, Xbox Series X/S, Switch OLED
+//   midtier  — iPhone 12-14, Galaxy S21-S23, iPad Air/mini 5th gen+, MacBook M1, PS4 Pro, Xbox One X/S, Switch V2
+//   old      — iPhone 11 and under, Galaxy S20 and under, older iPads/MacBooks, PS4 base, Xbox One base, Switch V1
+//
+// Condition gaps kept narrow (2-4 pts) so a grade revision doesn't shock the seller.
+// Consoles floor at /1.30 regardless of generation.
+
+const ROI_MULTIPLIERS = {
+  flagship: { Excellent: 1.20, Good: 1.23, Fair: 1.27 },
+  midtier:  { Excellent: 1.25, Good: 1.28, Fair: 1.32 },
+  old:      { Excellent: 1.30, Good: 1.33, Fair: 1.38 },
+  console:  { Excellent: 1.30, Good: 1.33, Fair: 1.38 }, // floor at 1.30 always
+};
+
+// Classify a device model into a generation tier
+function deviceGeneration(model, deviceType) {
+  if (!model) return 'midtier';
+  const m = model.toLowerCase();
+
+  if (deviceType === 'console') return 'console';
+
+  // iPhones
+  if (m.includes('iphone')) {
+    const num = parseInt((m.match(/iphone\s*(\d+)/i) || [])[1] || '0');
+    if (num >= 15) return 'flagship';
+    if (num >= 12) return 'midtier';
+    return 'old';
+  }
+
+  // Samsung Galaxy S
+  if (m.includes('galaxy s') || m.includes('samsung s')) {
+    const num = parseInt((m.match(/s(\d+)/i) || [])[1] || '0');
+    if (num >= 24) return 'flagship';
+    if (num >= 21) return 'midtier';
+    return 'old';
+  }
+
+  // iPad
+  if (m.includes('ipad pro')) {
+    if (m.includes('m2') || m.includes('m3') || m.includes('m4')) return 'flagship';
+    return 'midtier';
+  }
+  if (m.includes('ipad air') || m.includes('ipad mini')) {
+    const num = parseInt((m.match(/(\d+)(?:th|st|nd|rd)/i) || [])[1] || '0');
+    if (num >= 5) return 'midtier';
+    return 'old';
+  }
+  if (m.includes('ipad')) return 'old';
+
+  // MacBook
+  if (m.includes('macbook')) {
+    if (m.includes('m2') || m.includes('m3') || m.includes('m4')) return 'flagship';
+    if (m.includes('m1')) return 'midtier';
+    return 'old';
+  }
+
+  return 'midtier'; // safe default
+}
+
+function getMultiplier(deviceType, model, condition) {
+  const gen = deviceGeneration(model, deviceType);
+  const table = ROI_MULTIPLIERS[gen] || ROI_MULTIPLIERS.midtier;
+  return table[condition] || table.Good;
+}
+
+// ─── Merge + take HIGHER price (Back Market preferred) ───────────────────────
 function mergePrices(backMarketItems, sellCellItems) {
   const map = new Map();
 
@@ -154,21 +223,38 @@ function mergePrices(backMarketItems, sellCellItems) {
 
   const merged = [];
   for (const [, item] of map) {
-    const prices = [item.backmarket_price, item.sellcell_price].filter(Boolean);
-    if (prices.length === 0) continue;
+    // Prefer Back Market price; fall back to SellCell
+    const exitPrice = item.backmarket_price || item.sellcell_price;
+    if (!exitPrice || exitPrice < MIN_PAYOUT_CENTS) continue;
 
-    const offer = Math.min(...prices); // take the LOWER price
+    // Flag large variance for awareness (>35% gap between sources)
+    const hasBothSources = item.backmarket_price && item.sellcell_price;
+    const variance = hasBothSources
+      ? Math.abs(item.backmarket_price - item.sellcell_price) / Math.max(item.backmarket_price, item.sellcell_price)
+      : 0;
+    const flagged = variance > 0.35;
+
+    // Calculate offer using generation-tiered ROI formula: offer = exit_price / multiplier
+    const deviceType = deriveDeviceType(item.model, item.brand);
+    const multiplier = getMultiplier(deviceType, item.model, item.condition);
+    const offer = Math.round(exitPrice / multiplier);
+
     if (offer < MIN_PAYOUT_CENTS) continue;
+
+    // Routing: client payouts at/above $200 go to Clutch first for inspection + regrading
+    const routing = offer >= SHIP_TO_US_THRESHOLD_CENTS ? 'ship_to_clutch' : 'ship_direct';
 
     merged.push({
       model: item.model,
       brand: item.brand,
       storage: item.storage,
       condition: item.condition,
-      device_type: deriveDeviceType(item.model, item.brand),
+      device_type: deviceType,
       sellcell_price: item.sellcell_price,
       backmarket_price: item.backmarket_price,
-      offer_price: offer
+      offer_price: offer,
+      routing,           // 'ship_to_clutch' | 'ship_direct'
+      flagged: flagged ? 1 : 0
     });
   }
 
@@ -184,8 +270,8 @@ async function writeToD1(db, items) {
 
   const stmt = db.prepare(`
     INSERT INTO prices
-      (device_type, brand, model, storage, condition, sellcell_price, backmarket_price, offer_price, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (device_type, brand, model, storage, condition, sellcell_price, backmarket_price, offer_price, routing, flagged, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   // Batch in chunks of 100
@@ -201,6 +287,8 @@ async function writeToD1(db, items) {
         item.sellcell_price || null,
         item.backmarket_price || null,
         item.offer_price,
+        item.routing || 'ship_direct',
+        item.flagged || 0,
         now
       ))
     );

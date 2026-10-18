@@ -10,7 +10,9 @@ CREATE TABLE IF NOT EXISTS prices (
   condition   TEXT NOT NULL,   -- 'Excellent', 'Good', 'Fair'
   sellcell_price  INTEGER,     -- payout in cents, NULL if not found
   backmarket_price INTEGER,    -- payout in cents, NULL if not found
-  offer_price INTEGER NOT NULL, -- the lower of the two (what we offer), in cents
+  offer_price INTEGER NOT NULL, -- calculated offer (exit_price / ROI multiplier), in cents
+  routing     TEXT DEFAULT 'ship_direct', -- 'ship_to_clutch' (>=$200 offer) | 'ship_direct'
+  flagged     INTEGER DEFAULT 0, -- 1 = >35% variance between sources, review recommended
   updated_at  TEXT NOT NULL    -- ISO timestamp of last scrape
 );
 

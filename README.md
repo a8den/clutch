@@ -49,8 +49,13 @@ npx wrangler deploy
 | `/scrape` | POST | Manual scrape trigger (requires X-Admin-Secret header) |
 
 ## Price Sources
-- **Back Market** — primary buyback marketplace
-- **SellCell** — price comparison aggregator
-- **Logic**: takes the LOWER of the two prices to protect margin
-- **Filter**: drops anything under $50 payout
+- **Back Market** — primary buyback marketplace (preferred price)
+- **SellCell** — price comparison aggregator (fallback)
+- **Logic**: takes Back Market price preferentially; flags >35% variance between sources
+- **ROI formula**: `offer = exit_price / multiplier` — tiered by device generation:
+  - Flagship (iPhone 15+, S24+, PS5, Series X): Excellent /1.20, Good /1.23, Fair /1.27
+  - Mid-tier (iPhone 12-14, S21-S23, PS4 Pro): Excellent /1.25, Good /1.28, Fair /1.32
+  - Old (iPhone 11-, S20-, PS4 base): Excellent /1.30, Good /1.33, Fair /1.38
+- **Routing**: offers ≥$200 → `ship_to_clutch` (inspect first); under $200 → `ship_direct`
+- **Filter**: drops anything under $50 offer
 - **Schedule**: daily at 6:00am ET
