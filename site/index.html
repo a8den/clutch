@@ -787,6 +787,7 @@ function App() {
     } catch (e) { console.error("Lead save error:", e); }
     setSubmitted(true);
     setSubmitting(false);
+    setTimeout(() => { window.location.href = "/thank-you"; }, 1200);
   };
 
   // Demand badge colours — adapted for dark theme
