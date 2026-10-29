@@ -378,12 +378,13 @@ export default {
     }
   },
 
-  // HTTP endpoint — lets the site fetch prices, and lets you trigger a manual scrape
+  // HTTP endpoint
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const corsHeaders = {
-      'Access-Control-Allow-Origin': 'https://clutch.mancinimerchandising.com',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Pass',
       'Content-Type': 'application/json'
     };
 
@@ -391,53 +392,82 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // GET /prices?type=iphone  — fetch prices for a device type
-    if (url.pathname === '/prices') {
-      const type = url.searchParams.get('type');
-      const model = url.searchParams.get('model');
-      const storage = url.searchParams.get('storage');
-      const condition = url.searchParams.get('condition');
+    const isAdmin = request.headers.get('X-Admin-Pass') === 'cashout';
 
-      let query = 'SELECT * FROM prices WHERE 1=1';
-      const params = [];
-
-      if (type) { query += ' AND device_type = ?'; params.push(type); }
-      if (model) { query += ' AND model = ?'; params.push(model); }
-      if (storage) { query += ' AND storage = ?'; params.push(storage); }
-      if (condition) { query += ' AND condition = ?'; params.push(condition); }
-
-      query += ' ORDER BY device_type, model, storage, condition';
-
-      const { results } = await env.DB.prepare(query).bind(...params).all();
-      return new Response(JSON.stringify({ prices: results }), { headers: corsHeaders });
+    // ── GET /inventory ──
+    if (url.pathname === '/inventory' && request.method === 'GET') {
+      const raw = await env.CLUTCH_KV.get('inventory');
+      const inventory = raw ? JSON.parse(raw) : [];
+      return new Response(JSON.stringify({ inventory }), { headers: corsHeaders });
     }
 
-    // GET /models?type=iphone  — distinct model list for a device type
-    if (url.pathname === '/models') {
-      const type = url.searchParams.get('type') || 'iphone';
-      const { results } = await env.DB.prepare(
-        'SELECT DISTINCT model, brand FROM prices WHERE device_type = ? ORDER BY model'
-      ).bind(type).all();
-      return new Response(JSON.stringify({ models: results }), { headers: corsHeaders });
+    // ── POST /inventory ── (admin only — full replace)
+    if (url.pathname === '/inventory' && request.method === 'POST') {
+      if (!isAdmin) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
+      const body = await request.json();
+      const inventory = body.inventory || [];
+      await env.CLUTCH_KV.put('inventory', JSON.stringify(inventory));
+      return new Response(JSON.stringify({ ok: true, count: inventory.length }), { headers: corsHeaders });
     }
 
-    // GET /status  — last scrape time + price count
+    // ── POST /lead ──
+    if (url.pathname === '/lead' && request.method === 'POST') {
+      const lead = await request.json();
+      const raw = await env.CLUTCH_KV.get('leads');
+      const leads = raw ? JSON.parse(raw) : [];
+      leads.unshift(lead);
+      await env.CLUTCH_KV.put('leads', JSON.stringify(leads));
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders });
+    }
+
+    // ── GET /leads ── (admin only)
+    if (url.pathname === '/leads' && request.method === 'GET') {
+      if (!isAdmin) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
+      const raw = await env.CLUTCH_KV.get('leads');
+      const leads = raw ? JSON.parse(raw) : [];
+      return new Response(JSON.stringify({ leads }), { headers: corsHeaders });
+    }
+
+    // ── PATCH /lead/:id ── (admin only — update status)
+    if (url.pathname.startsWith('/lead/') && request.method === 'PATCH') {
+      if (!isAdmin) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
+      const id = url.pathname.split('/')[2];
+      const { status } = await request.json();
+      const raw = await env.CLUTCH_KV.get('leads');
+      const leads = raw ? JSON.parse(raw) : [];
+      const lead = leads.find(l => l.id === id);
+      if (lead) lead.status = status;
+      await env.CLUTCH_KV.put('leads', JSON.stringify(leads));
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders });
+    }
+
+    // ── GET /prices ── (KV cache — falls back to empty)
+    if (url.pathname === '/prices' && request.method === 'GET') {
+      const raw = await env.CLUTCH_KV.get('prices');
+      const prices = raw ? JSON.parse(raw) : [];
+      return new Response(JSON.stringify({ prices }), { headers: corsHeaders });
+    }
+
+    // ── POST /prices ── (admin only — store price overrides)
+    if (url.pathname === '/prices' && request.method === 'POST') {
+      if (!isAdmin) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
+      const body = await request.json();
+      await env.CLUTCH_KV.put('prices', JSON.stringify(body.prices || []));
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders });
+    }
+
+    // ── GET /status ──
     if (url.pathname === '/status') {
-      const { results } = await env.DB.prepare(
-        `SELECT (SELECT value FROM config WHERE key='last_scrape') as last_scrape,
-                (SELECT COUNT(*) FROM prices) as price_count`
-      ).all();
-      return new Response(JSON.stringify(results[0]), { headers: corsHeaders });
-    }
-
-    // POST /scrape  — manual trigger (admin only, protected by secret header)
-    if (url.pathname === '/scrape' && request.method === 'POST') {
-      const auth = request.headers.get('X-Admin-Secret');
-      if (auth !== env.ADMIN_SECRET) {
-        return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: corsHeaders });
-      }
-      ctx.waitUntil(this.scheduled(null, env, ctx));
-      return new Response(JSON.stringify({ message: 'Scrape triggered' }), { headers: corsHeaders });
+      const [inv, leads, prices] = await Promise.all([
+        env.CLUTCH_KV.get('inventory'),
+        env.CLUTCH_KV.get('leads'),
+        env.CLUTCH_KV.get('prices'),
+      ]);
+      return new Response(JSON.stringify({
+        inventory: inv ? JSON.parse(inv).length : 0,
+        leads: leads ? JSON.parse(leads).length : 0,
+        prices: prices ? JSON.parse(prices).length : 0,
+      }), { headers: corsHeaders });
     }
 
     return new Response(JSON.stringify({ error: 'Not found' }), { status: 404, headers: corsHeaders });
