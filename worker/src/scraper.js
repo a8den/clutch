@@ -394,7 +394,7 @@ export default {
 
     const isAdmin = request.headers.get('X-Admin-Pass') === 'cashout';
 
-    // ── GET /inventory ──
+    // ── GET /inventory ── (public)
     if (url.pathname === '/inventory' && request.method === 'GET') {
       const raw = await env.CLUTCH_KV.get('inventory');
       const inventory = raw ? JSON.parse(raw) : [];
