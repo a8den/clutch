@@ -15,7 +15,9 @@ How the sheet maps to the site
 - Only rows with Functional = Yes, Appearance/Screen = Good, Sides = Good (or "-")
   and, for phones, Carrier = Unlocked become base payouts. The site applies its
   own grade factors (Used 0.80, Cracked 0.47) and carrier penalties on top.
-- Phones: key "<model> <storage>", e.g. "iPhone 16 Pro 256GB".
+- Phones and iPads: key "<model> <storage>", e.g. "iPhone 16 Pro 256GB".
+- MacBooks (Category "Laptop"): Storage holds "<RAM>GB/<SSD>", key e.g.
+  "MacBook Pro 14in M4 16GB/512GB".
 - Consoles: "<site model> <storage>" when the site offers more than one storage
   size for that console, otherwise just "<site model>" (same as the wizard).
 - Consoles with several accessory rows use the standard bundle (1 controller,
@@ -67,6 +69,11 @@ CONSOLE_MODELS = {
     "2ds xl": "Nintendo 2DS XL",
     "steam deck oled": "Steam Deck OLED",
     "steam deck lcd": "Steam Deck LCD",
+}
+# Sheet model name -> site model name, where they differ
+PHONE_ALIASES = {
+    "Galaxy Z Fold6": "Galaxy Z Fold 6",
+    "Galaxy Z Flip6": "Galaxy Z Flip 6",
 }
 # Preferred accessory bundle when a console has several Good quotes
 ACCESSORY_PREF = ["1 controller", "2 controllers + dock", "2 or more controllers",
@@ -143,10 +150,21 @@ def main():
             label = storage_label(r.get("Storage (GB)"))
         except (TypeError, ValueError):
             label = None
+        model = PHONE_ALIASES.get(model, model)
         if cat_raw == "phone":
             category = "iPhone" if model.lower().startswith("iphone") else "Samsung"
             if model in storage_map and label in storage_map[model]:
                 key = f"{model} {label}"
+        elif cat_raw == "tablet":
+            category = "iPad"
+            if model in storage_map and label in storage_map[model]:
+                key = f"{model} {label}"
+        elif cat_raw == "laptop":
+            # MacBook storage is "<RAM>GB/<SSD>", e.g. "16GB/512GB", as the site lists it
+            category = "MacBook"
+            cfg = (r.get("Storage (GB)") or "").strip()
+            if model in storage_map and cfg in storage_map[model]:
+                key = f"{model} {cfg}"
         elif cat_raw == "console":
             category = "Gaming"
             site_model = CONSOLE_MODELS.get(model.lower())
