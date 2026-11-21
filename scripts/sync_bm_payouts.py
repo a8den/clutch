@@ -9,7 +9,8 @@ diff, commit, and merge like any other change.
 
 Usage:
     python3 scripts/sync_bm_payouts.py path/to/bm_quotes.csv \
-        [--site site/index.html] [--report bm_sync_report.md] [--dry-run]
+        [--sellcell sellcell.csv] [--site site/index.html] \
+        [--report bm_sync_report.md] [--dry-run]
 
 How the sheet maps to the site
 - Only rows with Functional = Yes, Appearance/Screen = Good, Sides = Good (or "-")
@@ -22,7 +23,16 @@ How the sheet maps to the site
   size for that console, otherwise just "<site model>" (same as the wizard).
 - Consoles with several accessory rows use the standard bundle (1 controller,
   or 2 controllers + dock for Nintendo) over a "0 controllers" quote.
-- "No offer" rows are reported, never written.
+- "No offer" rows are reported, never written as a Back Market payout.
+- Where Back Market gives no offer, the SellCell CSV (columns "Key",
+  "SellCell payout ($)", "Date pulled"; Key is the site key, payout is the best
+  Good-condition price) fills in. With no SellCell price either, the option
+  goes in NOT_BOUGHT and the wizard says Clutch isn't buying it right now.
+  An unquoted size the old price list pays above every quoted size of that
+  model goes in NOT_BOUGHT too, so it can't overpay.
+- Used and Cracked rows become GRADE_CAPS where Back Market pays less for that
+  grade than the site's grade factor would: the wizard then prices that grade
+  off Back Market's payout for it instead.
 - Every other price in DEFAULT_CASHOUT is left alone.
 
 The customer price in the report uses the site's own formula:
@@ -100,7 +110,7 @@ def parse_js_object(src, name):
 def parse_generated(src):
     if BEGIN not in src:
         return {}
-    block = src.split(BEGIN, 1)[1].split(END, 1)[0]
+    block = src.split(BEGIN, 1)[1].split(END, 1)[0].split("const SELLCELL_PAYOUTS", 1)[0]
     return {k: float(v) for k, v in re.findall(r'"([^"]+)"\s*:\s*(\d+(?:\.\d+)?)', block)}
 
 
@@ -111,6 +121,7 @@ def offer(payout, category, grade="Good"):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csv")
+    ap.add_argument("--sellcell", default=None)
     ap.add_argument("--site", default="site/index.html")
     ap.add_argument("--report", default=None)
     ap.add_argument("--dry-run", action="store_true")
@@ -200,21 +211,58 @@ def main():
         payouts[key] = int(round(opts[0][1]))
         meta[key] = opts[0]
 
-    # Write the generated block
-    pulled = max(dates) if dates else datetime.date.today().isoformat()
-    lines = [BEGIN,
-             f"// Back Market trade-in payouts (Good, unlocked, functional). Quotes pulled {pulled}.",
-             "// Keys are \"<model> <storage>\" (phones, multi-storage consoles) or \"<model>\".",
-             "const BM_PAYOUTS = {"]
-    for k in sorted(payouts):
-        lines.append(f'  {json.dumps(k)}:{payouts[k]},')
-    lines += ["};", END]
-    block = "\n".join(lines)
-    if BEGIN in src:
-        new_src = src.split(BEGIN, 1)[0] + block + src.split(END, 1)[1]
-    else:
-        sys.exit("BM_PAYOUTS markers not found in site file; add them once by hand first.")
+    # Grade caps: Back Market's payout for a worse grade, where it is below
+    # what the site's grade factor gives from the Good payout
+    grade_best = {}
+    for key, cat, grade, bm, desc in other_grades:
+        if grade not in ("Used", "Cracked"):
+            continue
+        a = desc.split(", ")[1].lower() if ", " in desc else ""
+        rank = ACCESSORY_PREF.index(a) if a in ACCESSORY_PREF else 0
+        cur = grade_best.get((grade, key))
+        if cur is None or rank < cur[0]:
+            grade_best[(grade, key)] = (rank, int(round(bm)), cat, desc)
+    grade_caps = {}
+    for (grade, key), (_, bm, cat, desc) in grade_best.items():
+        good = payouts.get(key)
+        if good and bm < good * GRADE_FACTOR[grade]:
+            grade_caps.setdefault(grade, {})[key] = bm
 
+    # SellCell fallback and options the site stops buying
+    sellcell, sc_dates = {}, set()
+    if args.sellcell:
+        for r in csv.DictReader(open(args.sellcell, newline="", encoding="utf-8")):
+            k = (r.get("Key") or "").strip()
+            v = (r.get("SellCell payout ($)") or "").strip().replace("$", "").replace(",", "")
+            if not k:
+                continue
+            if r.get("Date pulled"):
+                sc_dates.add(r["Date pulled"].strip())
+            try:
+                sellcell[k] = int(round(float(v)))
+            except ValueError:
+                sellcell[k] = None
+    sc_payouts, not_bought = {}, {}
+    for key, desc, _ in no_offer:
+        if key in payouts:
+            continue
+        if sellcell.get(key):
+            sc_payouts[key] = sellcell[key]
+        else:
+            not_bought[key] = ("Back Market gives no offer; SellCell has none"
+                               if key in sellcell else
+                               "Back Market gives no offer; no SellCell price on file")
+    valid = {f"{m} {o}" for m, opts in storage_map.items() for o in opts}
+    valid |= {(f"{m} {o}" if len(opts) > 1 else m) for m, opts in console_storage.items() for o in opts}
+    for key, v in sellcell.items():
+        if key not in valid:
+            unmapped.append(f"SellCell row {key}")
+            sc_payouts.pop(key, None)
+            continue
+        if v and key not in payouts and key not in sc_payouts:
+            sc_payouts[key] = v
+
+    pulled = max(dates) if dates else datetime.date.today().isoformat()
     # Report
     def old_value(key):
         if key in previous:
@@ -248,13 +296,29 @@ def main():
         if not p:
             continue
         site = offer(p, cat, grade)
+        if key in grade_caps.get(grade, {}):
+            continue  # now priced off Back Market's payout for this grade
         if site >= bm * 0.8:  # under 20% margin on this grade
             flags.append(f"- {desc}: site offers ${site}, Back Market pays ${int(bm)}")
     if flags:
         rep += ["## Grades where the site's grade factor pays too much", ""] + flags + [""]
-    if no_offer:
-        rep += ["## Back Market gave no offer (site price left as is)", ""]
-        rep += [f"- {d} (site still pays from ${int(old_value(k) or 0)} payout)" for k, d, _ in no_offer] + [""]
+    if sc_payouts:
+        rep += ["## Priced from SellCell (Back Market gives no offer or no quote yet)", "",
+                "| Site option | Old payout | SellCell payout | Customer offer (Good, unlocked, shipped) |",
+                "|---|---:|---:|---:|"]
+        for k, v in sorted(sc_payouts.items()):
+            old = old_value(k)
+            cat = "iPad" if k.startswith("iPad") else ("Samsung" if k.startswith("Galaxy") else "Gaming")
+            rep.append(f"| {k} | ${int(old or 0)} | ${v} | ${offer(v, cat)} |")
+        rep.append("")
+    if grade_caps:
+        rep += ["## Grades now priced off Back Market's payout for that grade", ""]
+        for g in sorted(grade_caps):
+            for k, v in sorted(grade_caps[g].items()):
+                cat = meta[k][3]
+                rep.append(f"- {k}, {g}: Back Market pays ${v}; site offer was ${offer(payouts[k], cat, g)}, "
+                           f"now ${round(max(v - SHIP_COST.get(cat, 12), 0) * MARGIN)}")
+        rep.append("")
     # Site options on a quoted model that still fall back to the old model-level price
     fallbacks = []
     quoted_models = {}
@@ -267,12 +331,50 @@ def main():
         missing = [o for o in opts if f"{m} {o}" not in payouts]
         for o in missing:
             fb = base.get(f"{m} {o}", base.get(m))
-            warn = " (higher than every quoted size)" if fb and fb > max(vals) else ""
-            fallbacks.append(f"- {m} {o}: no quote yet, site uses ${int(fb or 0)}{warn}")
+            k = f"{m} {o}"
+            if k in sc_payouts or k in not_bought:
+                continue
+            if fb and fb > max(vals):
+                not_bought[k] = f"no quote yet, and the old ${int(fb)} price was above every quoted size"
+                continue
+            fallbacks.append(f"- {k}: no quote yet, site uses ${int(fb or 0)}")
     if fallbacks:
         rep += ["## Sizes with no quote yet (still on the old model price)", ""] + fallbacks + [""]
     if unmapped:
         rep += ["## Sheet rows that don't match a site option", ""] + [f"- {d}" for d in unmapped] + [""]
+
+    if not_bought:
+        rep += ["## Now shown as not bought", ""]
+        rep += [f"- {k}: {why}" for k, why in sorted(not_bought.items())] + [""]
+
+    # Write the generated block
+    lines = [BEGIN,
+             f"// Back Market trade-in payouts (Good, unlocked, functional). Quotes pulled {pulled}.",
+             "// Keys are \"<model> <storage>\" (phones, multi-storage consoles) or \"<model>\".",
+             "const BM_PAYOUTS = {"]
+    for k in sorted(payouts):
+        lines.append(f'  {json.dumps(k)}:{payouts[k]},')
+    lines += ["};"]
+    sc_pulled = max(sc_dates) if sc_dates else pulled
+    lines += [f"// SellCell best Good payout, used only where Back Market gives no offer. Pulled {sc_pulled}.",
+              "const SELLCELL_PAYOUTS = {"]
+    lines += [f'  {json.dumps(k)}:{v},' for k, v in sorted(sc_payouts.items())]
+    lines += ["};",
+              "// Options Clutch isn't buying right now: no Back Market or SellCell price.",
+              "const NOT_BOUGHT = ["]
+    lines += [f'  {json.dumps(k)},' for k in sorted(not_bought)]
+    lines += ["];",
+              "// Back Market's payout for a worse grade, where it is below payout x grade factor.",
+              "const GRADE_CAPS = {"]
+    for g in sorted(grade_caps):
+        inner = ", ".join(f"{json.dumps(k)}:{v}" for k, v in sorted(grade_caps[g].items()))
+        lines.append(f"  {g}:{{ {inner} }},")
+    lines += ["};", END]
+    block = "\n".join(lines)
+    if BEGIN in src:
+        new_src = src.split(BEGIN, 1)[0] + block + src.split(END, 1)[1]
+    else:
+        sys.exit("BM_PAYOUTS markers not found in site file; add them once by hand first.")
 
     report = "\n".join(rep)
     if args.report:

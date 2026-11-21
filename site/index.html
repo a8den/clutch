@@ -784,6 +784,95 @@ const BM_PAYOUTS = {
   "iPhone XS Max 512GB":86,
   "iPhone XS Max 64GB":72,
 };
+// SellCell best Good payout, used only where Back Market gives no offer. Pulled 2026-11-21.
+const SELLCELL_PAYOUTS = {
+  "Steam Deck OLED 1TB":503,
+  "Steam Deck OLED 512GB":403,
+  "iPad Pro 11in M5 Nano-texture display 5G 1TB":775,
+  "iPad Pro 11in M5 Nano-texture display 5G 256GB":581,
+  "iPad Pro 11in M5 Nano-texture display 5G 2TB":880,
+  "iPad Pro 11in M5 Nano-texture display 5G 512GB":631,
+  "iPad Pro 11in M5 Nano-texture display WiFi 1TB":745,
+  "iPad Pro 11in M5 Nano-texture display WiFi 256GB":551,
+  "iPad Pro 11in M5 Nano-texture display WiFi 2TB":850,
+  "iPad Pro 11in M5 Nano-texture display WiFi 512GB":601,
+  "iPad Pro 11in M5 Standard display 5G 1TB":759,
+  "iPad Pro 11in M5 Standard display 5G 256GB":609,
+  "iPad Pro 11in M5 Standard display 5G 2TB":859,
+  "iPad Pro 11in M5 Standard display 5G 512GB":659,
+  "iPad Pro 11in M5 Standard display WiFi 1TB":729,
+  "iPad Pro 11in M5 Standard display WiFi 256GB":579,
+  "iPad Pro 11in M5 Standard display WiFi 2TB":829,
+  "iPad Pro 11in M5 Standard display WiFi 512GB":633,
+  "iPad Pro 13in M5 Nano-texture display 5G 1TB":948,
+  "iPad Pro 13in M5 Nano-texture display 5G 256GB":671,
+  "iPad Pro 13in M5 Nano-texture display 5G 2TB":1070,
+  "iPad Pro 13in M5 Nano-texture display 5G 512GB":721,
+  "iPad Pro 13in M5 Nano-texture display WiFi 1TB":918,
+  "iPad Pro 13in M5 Nano-texture display WiFi 256GB":641,
+  "iPad Pro 13in M5 Nano-texture display WiFi 2TB":1040,
+  "iPad Pro 13in M5 Nano-texture display WiFi 512GB":691,
+  "iPad Pro 13in M5 Standard display 5G 1TB":921,
+  "iPad Pro 13in M5 Standard display 5G 256GB":696,
+  "iPad Pro 13in M5 Standard display 5G 2TB":1056,
+  "iPad Pro 13in M5 Standard display 5G 512GB":746,
+  "iPad Pro 13in M5 Standard display WiFi 1TB":891,
+  "iPad Pro 13in M5 Standard display WiFi 256GB":666,
+  "iPad Pro 13in M5 Standard display WiFi 2TB":1026,
+  "iPad Pro 13in M5 Standard display WiFi 512GB":716,
+};
+// Options Clutch isn't buying right now: no Back Market or SellCell price.
+const NOT_BOUGHT = [
+  "Galaxy A55 128GB",
+  "Galaxy A55 256GB",
+  "Galaxy S23 Ultra 256GB",
+  "Galaxy S25+ 128GB",
+  "Galaxy Z Flip 6 256GB",
+  "Galaxy Z Flip 6 512GB",
+  "Galaxy Z Fold 6 1TB",
+  "Galaxy Z Fold 6 256GB",
+  "Galaxy Z Fold 6 512GB",
+  "Steam Deck LCD 512GB",
+  "Xbox Series X 2TB",
+  "iPad Air 11in M4 5G 128GB",
+  "iPad Air 11in M4 5G 1TB",
+  "iPad Air 11in M4 5G 256GB",
+  "iPad Air 11in M4 5G 512GB",
+  "iPad Air 11in M4 WiFi 128GB",
+  "iPad Air 11in M4 WiFi 1TB",
+  "iPad Air 11in M4 WiFi 256GB",
+  "iPad Air 11in M4 WiFi 512GB",
+  "iPad Air 13in M3 5G 128GB",
+  "iPad Air 13in M3 5G 1TB",
+  "iPad Air 13in M3 5G 256GB",
+  "iPad Air 13in M3 5G 512GB",
+  "iPad Air 13in M3 WiFi 128GB",
+  "iPad Air 13in M3 WiFi 1TB",
+  "iPad Air 13in M3 WiFi 256GB",
+  "iPad Air 13in M3 WiFi 512GB",
+  "iPad Air 13in M4 5G 128GB",
+  "iPad Air 13in M4 5G 1TB",
+  "iPad Air 13in M4 5G 256GB",
+  "iPad Air 13in M4 5G 512GB",
+  "iPad Air 13in M4 WiFi 128GB",
+  "iPad Air 13in M4 WiFi 1TB",
+  "iPad Air 13in M4 WiFi 256GB",
+  "iPad Air 13in M4 WiFi 512GB",
+  "iPad Pro 11in M4 Nano-texture display 5G 256GB",
+  "iPad Pro 11in M4 Nano-texture display 5G 512GB",
+  "iPad Pro 11in M4 Nano-texture display WiFi 256GB",
+  "iPad Pro 11in M4 Nano-texture display WiFi 512GB",
+  "iPad Pro 12.9in 6th Gen 4G LTE 256GB",
+  "iPad Pro 13in M4 Nano-texture display 5G 256GB",
+  "iPad Pro 13in M4 Nano-texture display 5G 512GB",
+  "iPad Pro 13in M4 Nano-texture display WiFi 256GB",
+  "iPad Pro 13in M4 Nano-texture display WiFi 512GB",
+];
+// Back Market's payout for a worse grade, where it is below payout x grade factor.
+const GRADE_CAPS = {
+  Cracked:{ "Xbox Series S 1TB":35, "Xbox Series S 512GB":88 },
+  Used:{ "Xbox One S 1TB":80, "Xbox One S 500GB":88 },
+};
 // ── END BM_PAYOUTS ──
 
 // ── Base cashout prices (module scope so variant picker can reference them) ──
@@ -868,9 +957,10 @@ const DEFAULT_CASHOUT = {
   "Meta Quest 3":180,"Meta Quest 3S":95,"Meta Quest 2 256GB":70,"Meta Quest 2 128GB":55,
   "Meta Quest Pro":220,"Oculus Quest 1":45,"Oculus Rift S":60,
 };
-// Back Market payouts (above) win over the hand-set defaults; storage-specific keys
-// like "iPhone 16 Pro 256GB" are checked before the plain model key in fetchOffer.
-Object.assign(DEFAULT_CASHOUT, BM_PAYOUTS);
+// Back Market payouts (above) win over the hand-set defaults; SellCell fills in only
+// where Back Market gives no offer. Storage-specific keys like "iPhone 16 Pro 256GB"
+// are checked before the plain model key in fetchOffer.
+Object.assign(DEFAULT_CASHOUT, SELLCELL_PAYOUTS, BM_PAYOUTS);
 window.DEFAULT_CASHOUT = DEFAULT_CASHOUT; // lets the admin Prices tab list every key
 
 // ── Dark-theme color tokens (matching landing page) ──
@@ -1037,6 +1127,11 @@ function App() {
 
     const storageKey = isGaming ? consoleStorage : storage.trim();
     const cashoutKey = storageKey ? `${model} ${storageKey}` : model;
+    // Options with no Back Market or SellCell price: say we're not buying them,
+    // unless an admin price override exists for that exact key.
+    if (NOT_BOUGHT.includes(cashoutKey) && !(window.__clutchPrices && window.__clutchPrices[cashoutKey])) {
+      setResult({ error:true, notBought:true }); setLoading(false); return;
+    }
     const cashout = CASHOUT[cashoutKey] || CASHOUT[model] || 0;
     if (!cashout) { setResult({ error:true }); setLoading(false); return; }
 
@@ -1051,6 +1146,9 @@ function App() {
     if (condition === "sealed")        condFactor = 1.0;
     else if (condition === "no_power") condFactor = 0.30;
     else if (condition === "graded" && worstGrade) condFactor = GRADE_FACTOR[worstGrade] || 1.0;
+    // Where Back Market pays less for this grade than the factor implies, price off its payout
+    const gradeCap = condition === "graded" && worstGrade && GRADE_CAPS[worstGrade] && GRADE_CAPS[worstGrade][cashoutKey];
+    if (gradeCap) condFactor = Math.min(condFactor, Math.max(gradeCap - shipCost, 0) / Math.max(cashout - shipCost, 1));
 
     const carrierFactors = { unlocked:1.0, att:0.80, verizon:0.80, tmobile:0.75, mvno:0.70, unknown:0.85 };
     const cFactor = carrierFactors[carrier] || 1.0;
@@ -1774,7 +1872,7 @@ function App() {
 
       {result?.error && (
         <div className="wcard wfade" style={{ textAlign:"center", padding:"2rem" }}>
-          <p style={{ margin:"0 0 14px", color:T.muted }}>Something went wrong — please try again.</p>
+          <p style={{ margin:"0 0 14px", color:T.muted }}>{result.notBought ? "We're not buying this model right now. Check back soon, or pick a different device." : "Something went wrong — please try again."}</p>
           <button className="wbtnsec" onClick={reset}>Start over</button>
         </div>
       )}
