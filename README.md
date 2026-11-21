@@ -59,3 +59,17 @@ npx wrangler deploy
 - **Routing**: offers ≥$200 → `ship_to_clutch` (inspect first); under $200 → `ship_direct`
 - **Filter**: drops anything under $50 offer
 - **Schedule**: daily at 6:00am ET
+
+## Syncing Back Market payouts
+The quote wizard's base payouts for each model and storage come from the
+`BM_PAYOUTS` block in `site/index.html`, generated from the "BM Quotes" tab of the
+Clutch Marketplace Lead Tracker sheet:
+
+```bash
+# File → Download → CSV on the BM Quotes tab, then:
+python3 scripts/sync_bm_payouts.py ~/Downloads/bm_quotes.csv --report bm_sync_report.md
+```
+
+The script only rewrites that block (hand-set defaults stay as fallbacks) and
+prints which prices changed, sizes with no quote yet, and grades where the site
+would pay too much. Review the diff and merge; nothing deploys on its own.
